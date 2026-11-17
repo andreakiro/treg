@@ -55,6 +55,7 @@ sources:
   - src/treg/domain/identity/promotions.py
   - src/treg/alembic/versions/0033_signup_promo_eligibility.py
   - src/treg/alembic/versions/0071_signup_promo_claim.py
+  - src/treg/alembic/versions/0109_topup_bonus_override.py
   - src/treg/routers/admin.py
   - src/treg/routers/billing.py
   - src/treg/routers/call.py
@@ -501,6 +502,11 @@ purchased block stays exactly what the card paid: purchased credit is a refundab
 bonus is marketing spend. The billing page shows the bonus each refill earns and the next tier up.
 The grant's meta carries `payment_intent`, `pct` and `topup_block_id`, which `topup_history` joins
 to show `bonus_micro`.
+
+A per-org override (`Org.topup_bonus_pct`, 0–50%, set via `PUT /admin/orgs/{id}/topup-bonus`) raises
+the rate for one team: the effective pct is `max(override, tier)`, so the override never makes the
+team worse off than the global tiers. When the override raised the rate, `meta.override = true`
+records it. Staff set and clear it; the team never sees or sets it.
 
 `_grant_topup_bonus` grants per payment, not per first delivery: every delivery, and the inline
 auto-top-up credit, grants when no `topup_bonus` entry names the PaymentIntent. A lock on the

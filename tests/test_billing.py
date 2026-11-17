@@ -1998,7 +1998,7 @@ async def test_pm_and_fingerprint_survives_sdk_objects(monkeypatch):
     (250, 37_500_000, 15), (2_000, 300_000_000, 15),
 ])
 def test_bonus_tiers_apply_the_highest_floor_at_or_below_the_amount(usd, bonus, pct):
-    assert billing.bonus_for_topup(usd * 1_000_000) == (bonus, pct)
+    assert billing.bonus_for_topup(usd * 1_000_000) == (bonus, pct, False)
 
 
 @pytest.mark.parametrize("amount", [1, 5, 0.5, 2.5, 99_999, "x"])
@@ -2436,3 +2436,182 @@ async def test_a_refund_of_fully_spent_credit_is_still_recorded(c: AsyncClient, 
     assert r["held_micro"] == 0
     history = (await c.get("/billing/history", headers=_h(owner))).json()["items"]
     assert history[0]["refunded_micro"] == 10_000_000
+
+
+# ---- per-org top-up bonus override -------------------------------------------------------------
+def test_bonus_override_null_uses_tier():
+    """With no override, the tier-based bonus applies."""
+    # $100 top-up → 10% tier bonus
+    bonus, pct, override_applied = billing.bonus_for_topup(100_000_000, org_override_pct=None)
+    assert bonus == 10_000_000 and pct == 10 and override_applied is False
+
+
+def test_bonus_override_higher_than_tier_uses_override():
+    """When override > tier, the override wins."""
+    # $20 top-up → 0% tier but 15% override → 15%
+    bonus, pct, override_applied = billing.bonus_for_topup(20_000_000, org_override_pct=15)
+    assert bonus == 3_000_000 and pct == 15 and override_applied is True
+
+
+def test_bonus_override_lower_than_tier_uses_tier():
+    """When override < tier, the tier wins (never worse off)."""
+    # $200 top-up → 15% tier but 10% override → 15% (tier wins)
+    bonus, pct, override_applied = billing.bonus_for_topup(200_000_000, org_override_pct=10)
+    assert bonus == 30_000_000 and pct == 15 and override_applied is False
+
+
+def test_bonus_override_zero_allows_tier():
+    """A 0% override still allows the tier to apply."""
+    # $100 top-up → 10% tier, 0% override → 10% (tier wins)
+    bonus, pct, override_applied = billing.bonus_for_topup(100_000_000, org_override_pct=0)
+    assert bonus == 10_000_000 and pct == 10 and override_applied is False
+
+
+async def test_per_org_bonus_override_applies_to_topup(c: AsyncClient, monkeypatch):
+    """An org with topup_bonus_pct=15 gets 15% bonus on a $20 top-up (normally 0%)."""
+    org_id, owner = await _org(c)
+    monkeypatch.setattr(billing, "_sdk", _no_sdk)
+    await _set_org(org_id, topup_bonus_pct=15)
+    await _deliver(c, _pi_event(org_id, pi="pi_override", cents=2_000))  # $20 → 0% tier
+    body = (await c.get(f"/orgs/{org_id}/balance", headers=_h(owner))).json()
+    # $20 + 15% bonus = $23
+    promo = get_settings().promo_grant_micro
+    assert body["balance_micro"] == promo + 20_000_000 + 3_000_000
+    bonus_blocks = [b for b in body["blocks"] if b["kind"] == "bonus"]
+    assert len(bonus_blocks) == 1 and bonus_blocks[0]["amount_micro"] == 3_000_000
+    grants = [e for e in body["entries"]["items"]
+              if e["kind"] == "grant" and e["meta"].get("source") == "topup_bonus"]
+    assert len(grants) == 1
+    assert grants[0]["meta"]["pct"] == 15
+    assert grants[0]["meta"]["override"] is True
+
+
+async def test_per_org_bonus_override_does_not_worsen_tier(c: AsyncClient, monkeypatch):
+    """An org with topup_bonus_pct=5 on a $200 top-up still gets 15% (tier wins)."""
+    org_id, owner = await _org(c)
+    monkeypatch.setattr(billing, "_sdk", _no_sdk)
+    await _set_org(org_id, topup_bonus_pct=5)
+    await _deliver(c, _pi_event(org_id, pi="pi_tier_wins", cents=20_000))  # $200 → 15% tier
+    body = (await c.get(f"/orgs/{org_id}/balance", headers=_h(owner))).json()
+    promo = get_settings().promo_grant_micro
+    # $200 + 15% bonus = $230
+    assert body["balance_micro"] == promo + 200_000_000 + 30_000_000
+    grants = [e for e in body["entries"]["items"]
+              if e["kind"] == "grant" and e["meta"].get("source") == "topup_bonus"]
+    assert len(grants) == 1
+    assert grants[0]["meta"]["pct"] == 15
+    assert "override" not in grants[0]["meta"]  # tier won, no override flag
+
+
+async def test_webhook_retry_does_not_double_grant_with_override(c: AsyncClient, monkeypatch):
+    """A redelivered webhook with override grants the bonus once."""
+    org_id, owner = await _org(c)
+    monkeypatch.setattr(billing, "_sdk", _no_sdk)
+    await _set_org(org_id, topup_bonus_pct=15)
+    event = _pi_event(org_id, pi="pi_override_retry", cents=2_000)
+    r1 = await _deliver(c, event)
+    r2 = await _deliver(c, event)
+    assert r1.json()["credited"] is True
+    assert r2.json()["credited"] is False
+    body = (await c.get(f"/orgs/{org_id}/balance", headers=_h(owner))).json()
+    bonus_blocks = [b for b in body["blocks"] if b["kind"] == "bonus"]
+    assert len(bonus_blocks) == 1 and bonus_blocks[0]["amount_micro"] == 3_000_000
+
+
+async def test_refund_revokes_override_bonus_correctly(c: AsyncClient, monkeypatch):
+    """A refund revokes the bonus from an override in proportion."""
+    org_id, owner = await _org(c)
+    monkeypatch.setattr(billing, "_sdk", _no_sdk)
+    await _set_org(org_id, topup_bonus_pct=15)
+    await _deliver(c, _pi_event(org_id, pi="pi_override_refund", cents=2_000))  # $20 + 15% = $23
+    body = (await c.get(f"/orgs/{org_id}/balance", headers=_h(owner))).json()
+    promo = get_settings().promo_grant_micro
+    assert body["balance_micro"] == promo + 23_000_000
+    # Half refund: $10 + 7.5% bonus = $10 + $1.5 bonus → remaining bonus should be ~$1.5
+    r = (await _deliver(c, _refund_event("pi_override_refund", 1_000))).json()
+    assert r["revoked_micro"] == 10_000_000 + 1_500_000  # $10 purchased + $1.5 bonus
+    body = (await c.get(f"/orgs/{org_id}/balance", headers=_h(owner))).json()
+    # promo + $10 purchased + $1.5 bonus remaining
+    assert body["balance_micro"] == promo + 10_000_000 + 1_500_000
+
+
+async def test_admin_can_set_and_clear_topup_bonus_override(c: AsyncClient, monkeypatch):
+    """The admin endpoint sets and clears the override, with audit log."""
+    admin_token = "admin_test_secret"
+    monkeypatch.setenv("TREG_ADMIN_TOKEN", admin_token)
+    get_settings.cache_clear()
+    org_id, _ = await _org(c)
+    h = {"X-Treg-Token": admin_token}
+
+    # Initially no override
+    async with session_maker() as db:
+        org = await db.get(Org, org_id)
+        assert org.topup_bonus_pct is None
+
+    # Set override to 15%
+    r = await c.put(f"/admin/orgs/{org_id}/topup-bonus",
+                    json={"pct": 15, "reason": "agreed with customer ecg"},
+                    headers=h)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["old_pct"] is None
+    assert body["new_pct"] == 15
+    assert body["reason"] == "agreed with customer ecg"
+    assert body["principal"] == "env-admin"
+
+    async with session_maker() as db:
+        org = await db.get(Org, org_id)
+        assert org.topup_bonus_pct == 15
+
+    # Clear override (set to null)
+    r = await c.put(f"/admin/orgs/{org_id}/topup-bonus",
+                    json={"pct": None, "reason": "contract ended"},
+                    headers=h)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["old_pct"] == 15
+    assert body["new_pct"] is None
+
+    async with session_maker() as db:
+        org = await db.get(Org, org_id)
+        assert org.topup_bonus_pct is None
+
+    get_settings.cache_clear()
+
+
+async def test_admin_topup_bonus_override_validates_range(c: AsyncClient, monkeypatch):
+    """The admin endpoint rejects out-of-range values."""
+    admin_token = "admin_test_secret"
+    monkeypatch.setenv("TREG_ADMIN_TOKEN", admin_token)
+    get_settings.cache_clear()
+    org_id, _ = await _org(c)
+    h = {"X-Treg-Token": admin_token}
+
+    # Too high
+    r = await c.put(f"/admin/orgs/{org_id}/topup-bonus",
+                    json={"pct": 51, "reason": "test"},
+                    headers=h)
+    assert r.status_code == 422
+
+    # Negative
+    r = await c.put(f"/admin/orgs/{org_id}/topup-bonus",
+                    json={"pct": -1, "reason": "test"},
+                    headers=h)
+    assert r.status_code == 422
+
+    # Missing reason
+    r = await c.put(f"/admin/orgs/{org_id}/topup-bonus",
+                    json={"pct": 15, "reason": ""},
+                    headers=h)
+    assert r.status_code == 422
+
+    get_settings.cache_clear()
+
+
+async def test_admin_topup_bonus_override_requires_superadmin(c: AsyncClient, monkeypatch):
+    """The endpoint requires superadmin auth."""
+    org_id, owner = await _org(c)
+    r = await c.put(f"/admin/orgs/{org_id}/topup-bonus",
+                    json={"pct": 15, "reason": "test"},
+                    headers={"X-Treg-Token": owner})
+    assert r.status_code in (401, 403)

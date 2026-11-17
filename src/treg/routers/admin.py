@@ -1005,3 +1005,58 @@ async def admin_credit_org(
         "block_id": block.id,
         "ref": ref,
     }
+
+
+class TopupBonusOverrideIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    pct: int | None = Field(ge=0, le=50, description="Bonus percent (0–50), or null to clear")
+    reason: str = Field(min_length=1, max_length=1000)
+
+    @field_validator("reason")
+    @classmethod
+    def nonblank_reason(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("reason must not be blank")
+        return value
+
+
+@mutations_router.put("/admin/orgs/{org_id}/topup-bonus")
+async def admin_set_topup_bonus_override(
+    org_id: int, body: TopupBonusOverrideIn, principal: str = Depends(require_superadmin),
+    db: AsyncSession = Depends(get_admin_session),
+) -> dict:
+    """Set or clear a per-org top-up bonus rate override.
+
+    When set, every top-up earns `max(override, global tier pct)`: the override never makes a
+    customer worse off than the global tier. Applies to manual top-ups and auto top-ups alike.
+
+    Set `pct` to an integer 0–50 to enable the override, or null to clear it and revert to global
+    tiers only. `reason` is required (human explanation for audit).
+
+    Returns the org_id, old value, new value, reason, and principal. The admin UI (if any) lives in
+    treg-internal; this API is the source of truth.
+    """
+    org = await db.get(Org, org_id)
+    if org is None:
+        raise HTTPException(status_code=404, detail="org not found")
+
+    old_pct = org.topup_bonus_pct
+    org.topup_bonus_pct = body.pct
+    db.add(org)
+    await db.commit()
+
+    import logging
+    logging.getLogger("treg.admin").info(
+        "topup_bonus_override org_id=%s old_pct=%s new_pct=%s reason=%r principal=%s",
+        org_id, old_pct, body.pct, body.reason, principal,
+    )
+
+    return {
+        "org_id": org_id,
+        "old_pct": old_pct,
+        "new_pct": body.pct,
+        "reason": body.reason,
+        "principal": principal,
+    }

@@ -134,23 +134,32 @@ def cents_to_micro(amount_cents: int) -> int:
     return int(amount_cents) * MICRO_PER_CENT
 
 
-def bonus_for_topup(amount_micro: int) -> tuple[int, int]:
+def bonus_for_topup(amount_micro: int, *, org_override_pct: int | None = None) -> tuple[int, int, bool]:
     """The promotional bonus a top-up of `amount_micro` earns, manual or automatic, as
-    `(bonus_micro, percent)`.
+    `(bonus_micro, percent, override_applied)`.
 
     Tiered by size (`topup_bonus_tiers`): the highest tier at or below the amount applies, so $99 gets
     the $50 rate and $250 the $200 rate. Integer micro-USD throughout — `amount * pct // 100`
     truncates the sub-micro remainder, which is at most a millionth of a dollar in treg's favour.
+
+    When `org_override_pct` is set, the effective rate is `max(override, tier_pct)`: the override
+    never makes a customer worse off than the global tier. `override_applied` is True when the
+    override raised the rate above the tier.
     """
     tiers = get_settings().topup_bonus_tiers or {}
     usd = int(amount_micro) // MICRO_PER_USD
-    pct = 0
+    tier_pct = 0
     for floor_usd in sorted(int(k) for k in tiers):
         if usd >= floor_usd:
-            pct = int(tiers[floor_usd] if floor_usd in tiers else tiers[str(floor_usd)])
+            tier_pct = int(tiers[floor_usd] if floor_usd in tiers else tiers[str(floor_usd)])
+    override_applied = False
+    pct = tier_pct
+    if org_override_pct is not None and org_override_pct > tier_pct:
+        pct = org_override_pct
+        override_applied = True
     if pct <= 0:
-        return 0, 0
-    return int(amount_micro) * pct // 100, pct
+        return 0, 0, False
+    return int(amount_micro) * pct // 100, pct, override_applied
 
 
 async def next_default_usd(db: AsyncSession, org_id: int | None) -> int:
@@ -1628,16 +1637,20 @@ async def _grant_topup_bonus(db: AsyncSession, org_id: int, pi_id: str, block_id
                              amount_micro: int) -> tuple[int, int]:
     """Grant a top-up's bonus unless this payment already has one; commits. Returns what this call
     granted, net of a refund recorded before it."""
-    bonus_micro, bonus_pct = bonus_for_topup(amount_micro)
+    org = await db.get(Org, org_id)
+    org_override_pct = org.topup_bonus_pct if org else None
+    bonus_micro, bonus_pct, override_applied = bonus_for_topup(amount_micro, org_override_pct=org_override_pct)
     if bonus_micro <= 0:
         return 0, 0
     created_at = await _lock_purchased_block(db, block_id)
     if _now() - created_at > BONUS_HEAL_WINDOW or pi_id in await _bonused_payments(db, org_id):
         await db.rollback()
         return 0, 0
-    bonus = await ledger.grant(db, org_id, amount_micro=bonus_micro, kind="bonus", once=False,
-                               meta={"source": "topup_bonus", "payment_intent": pi_id,
-                                     "pct": bonus_pct, "topup_block_id": block_id})
+    meta: dict = {"source": "topup_bonus", "payment_intent": pi_id,
+                  "pct": bonus_pct, "topup_block_id": block_id}
+    if override_applied:
+        meta["override"] = True
+    bonus = await ledger.grant(db, org_id, amount_micro=bonus_micro, kind="bonus", once=False, meta=meta)
     refunded = await _refunded_of(db, block_id)
     if refunded and bonus is not None:
         revoked = await ledger.revoke_in_transaction(
